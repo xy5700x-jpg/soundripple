@@ -1492,7 +1492,7 @@ function serializeTracks(){
   return DB.tracks.map(t=>({
     path:t.path, rel:t.rel||"", title:t.title, artist:t.artist, album:t.album,
     albumartist:t.albumartist, year:t.year, genre:t.genre, track:t.track, dur:t.dur,
-    lrc:t.lrc||null, cover:coverCache.get(t.id)||null
+    lrc:t.lrc||null, embedLrc:t.embedLrc||null, cover:coverCache.get(t.id)||null
   }));
 }
 async function persistTracks(){
@@ -1507,7 +1507,7 @@ function hydrate(rows){
   rows.forEach(r=>{
     const t={id:++idc,file:null,path:r.path,rel:r.rel||"",title:r.title,artist:r.artist,
       album:r.album,albumartist:r.albumartist||r.artist||"",year:r.year||"",genre:r.genre||"未知曲风",
-      track:r.track||0,dur:r.dur||0,cover:null,lrc:r.lrc||null};
+      track:r.track||0,dur:r.dur||0,cover:null,lrc:r.lrc||null,embedLrc:r.embedLrc||null};
     if(r.cover){try{coverCache.set(t.id,r.cover);t.cover=t.id;}catch(e){}}
     DB.tracks.push(t);
   });
@@ -1618,6 +1618,24 @@ async function collectEntries(dt){
 function scanDir(dt){
   return collectEntries(dt);
 }
+/* 读 .lrc 文本：utf-8 优先，出现连续替换字符说明是 GBK，再按 gbk 读一遍 */
+function readLrcText(f){
+  return new Promise(res=>{
+    const fr=new FileReader();
+    fr.onerror=()=>res("");
+    fr.onload=()=>{
+      const s=fr.result;
+      if(/\ufffd{2,}/.test(s)){
+        const f2=new FileReader();
+        f2.onerror=()=>res(s);
+        f2.onload=()=>res(f2.result);
+        f2.readAsText(f,"gbk");return;
+      }
+      res(s);
+    };
+    fr.readAsText(f,"utf-8");
+  });
+}
 async function ingest(files){
   if(!files.length)return;
   const lrcs=new Map();
@@ -1643,7 +1661,7 @@ async function ingest(files){
     const t=addTrack(f,tags,0);
     t.dur=await fastDuration(f);          // 头信息直算，绝大多数文件这一步就出结果
     const key=baseName(f.name).replace(/\.[^.]+$/,"").toLowerCase();
-    const lf=lrcs.get(key); if(lf)t.lrcFile=lf;
+    const lf=lrcs.get(key); if(lf){t.lrcFile=lf;t.lrc=await readLrcText(lf);}
     if(tags.lyric&&tags.lyric.length>1)t.embedLrc=tags.lyric;
     if(tags.pic&&tags.pic.length>100){
       try{
@@ -1680,13 +1698,43 @@ async function ingest(files){
   probeDurations();
 }
 /* 用当前编码设置重新解析已入库文件的标签（无需重新拖入） */
+/* 在音频文件同目录找同名 .lrc（重启后 File 句柄丢失，靠它重新定位外挂歌词） */
+async function findLrcFor(t){
+  if(!rootHandle||!t.rel)return null;
+  try{
+    const parts=t.rel.split("/").filter(Boolean);
+    let h=rootHandle;
+    for(let i=0;i<parts.length-1;i++)h=await h.getDirectoryHandle(parts[i]);
+    const base=parts[parts.length-1].replace(/\.[^.]+$/,"");
+    for(const nm of [base+".lrc",base+".LRC"]){
+      try{return await (await h.getFileHandle(nm)).getFile();}catch(e){}
+    }
+  }catch(e){}
+  return null;
+}
 async function retagAll(){
-  const has=DB.tracks.filter(t=>t.file);
-  if(!has.length){toast("没有可直接读取的文件");return;}
-  let n=0;
-  for(const t of has){
+  const list=DB.tracks.slice();
+  if(!list.length){toast("曲库为空");return;}
+  if(!rootHandle){
+    const h=await IDB.get("root").catch(()=>null);
+    if(!h){toast("需要文件夹权限 —— 请点底部的「立即连接」，或重新拖入音乐文件夹");return;}
+    rootHandle=h;
+    try{
+      const q=await rootHandle.queryPermission({mode:"read"});
+      if(q!=="granted"){
+        const r=await rootHandle.requestPermission({mode:"read"});
+        if(r!=="granted"){toast("需要文件夹权限才能重新解析");return;}
+      }
+    }catch(e){toast("需要文件夹权限 —— 请点底部的「立即连接」");return;}
+  }
+  let n=0,fail=0,lrcN=0;
+  for(let i=0;i<list.length;i++){
+    const t=list[i];
+    scanProgress(i+1,list.length);
+    const f=await fileFor(t);
+    if(!f){fail++;continue;}
     let tags={};
-    try{tags=await readTags(t.file);}catch(e){}
+    try{tags=await readTags(f);}catch(e){}
     if(tags.title){t.title=tags.title.trim();n++;}
     if(tags.artist)t.artist=tags.artist.trim();
     if(tags.albumartist||tags.artist)t.albumartist=(tags.albumartist||tags.artist).trim();
@@ -1694,7 +1742,13 @@ async function retagAll(){
     if(tags.genre)t.genre=tags.genre.trim();
     if(tags.year)t.year=String(tags.year).slice(0,4);
     if(tags.track)t.track=parseInt(tags.track,10)||0;
-    if(tags.lyric&&tags.lyric.length>1){t.embedLrc=tags.lyric;t._lrc=null;}
+    /* 内嵌歌词：重启后丢失的重灾区，这里补回来并随曲库持久化 */
+    if(tags.lyric&&tags.lyric.length>1){t.embedLrc=tags.lyric;t._lrc=null;lrcN++;}
+    /* 外挂 .lrc：File 句柄存不进 IndexedDB，重新定位后把文本读出来 */
+    if(!t.lrc){
+      const lf=await findLrcFor(t);
+      if(lf){t.lrcFile=lf;t.lrc=await readLrcText(lf);if(t.lrc)lrcN++;}
+    }
     if(tags.pic&&tags.pic.length>100){
       try{
         const mime=(tags.mime||"image/jpeg").split(";")[0];
@@ -1705,8 +1759,9 @@ async function retagAll(){
     }
   }
   reindex();render();
-  toast("已重新解析 "+n+" 首的标签");
+  toast("已解析 "+n+" 首 · 补回歌词 "+lrcN+" 首"+(fail?" · "+fail+" 首定位不到":""));
   persistTracks();
+  if(curTrack){curTrack._lrc=null;loadLyric(curTrack);}
 }
 function scanProgress(d,n){
   $("#title").innerHTML="正在扫描 <em>"+d+" / "+n+"</em>";
@@ -2389,7 +2444,8 @@ function renderSettings(body){
         '<option value="gb18030">GB18030</option><option value="big5">Big5</option>'+
         '<option value="shift_jis">Shift-JIS</option><option value="euc-kr">EUC-KR</option>'+
         '<option value="latin1">Latin-1</option></select></div>'+
-    '<div class="line"><div class="lb"><b>重新读取标签</b><i>改完编码后点此生效，需重新扫描的文件请重新拖入</i></div>'+
+    '<div class="line"><div class="lb"><b>重新读取标签</b>'+
+      '<i>改完编码后点此生效；重启后歌词/封面丢失，点此也能补回（需已连接文件夹）</i></div>'+
       '<button class="sbtn" id="btnRetag">重新解析已入库文件</button></div>'+
   '</div></div>';
   const sw=(id,key,after)=>{const e=$(id);if(!e)return;e.onclick=()=>{CFG[key]=!CFG[key];e.classList.toggle("on",CFG[key]);saveCfg();after&&after();};};
@@ -2828,7 +2884,11 @@ function loadLyric(t){
      设置里可切成「内嵌优先」（跟着文件走，不会因移动而丢失）。 */
   const preferEmbed=CFG.lrcSrc==="embed";
   const hasFile=!!t.lrcFile, hasEmbed=!!(t.embedLrc&&t.embedLrc.length>1);
+  /* 歌词文本已随曲库持久化（t.lrc 外挂 / t.embedLrc 内嵌），
+     重启后没有 File 句柄也能直接出歌词 —— 这是优先走的路 */
+  const hasText=!!(t.lrc&&t.lrc.length>1);
   if(preferEmbed&&hasEmbed){t._lrc=parseLRC(t.embedLrc);setLyric(t._lrc);return;}
+  if(hasText){t._lrc=parseLRC(t.lrc);setLyric(t._lrc);return;}
   if(!hasFile){
     if(hasEmbed){t._lrc=parseLRC(t.embedLrc);setLyric(t._lrc);return;}
     box.innerHTML='<div class="empty">无歌词</div>';return;
@@ -2836,7 +2896,7 @@ function loadLyric(t){
   const fr=new FileReader();
   fr.onload=()=>{
     const s=fr.result;
-    if(/�{2,}/.test(s)){          // 大概率是 GBK，重读一次
+    if(/ {2,}/.test(s)){          // 大概率是 GBK，重读一次
       const f2=new FileReader();
       f2.onload=()=>{t._lrc=parseLRC(f2.result);setLyric(t._lrc);};
       f2.readAsText(t.lrcFile,"gbk");return;
