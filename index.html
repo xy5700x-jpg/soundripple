@@ -1529,8 +1529,16 @@ async function restoreLibrary(){
           toast("已恢复音乐库："+DB.tracks.length+" 首，可直接播放");}
         else{showRelinkBar("连接音乐库以开始播放",
           "列表已恢复 "+DB.tracks.length+" 首 —— 授权一次即可播放（浏览器重启后会这样）");}
+      }else{
+        /* 句柄没存过 / 被清掉：以前这里什么都不做，用户看不到任何连接入口，
+           点播放只会反复提示「重新选择音乐文件夹」，最后只能重新导入整库 */
+        showRelinkBar("连接音乐库以开始播放",
+          "列表已恢复 "+DB.tracks.length+" 首 —— 点一下选择文件夹即可播放，不用重新导入");
       }
-    }catch(e){}
+    }catch(e){
+      showRelinkBar("连接音乐库以开始播放",
+        "列表已恢复 "+DB.tracks.length+" 首 —— 点一下授权即可播放，不用重新导入");
+    }
   }else{
     showRelinkBar("选择音乐文件夹","已载入 "+DB.tracks.length+" 首 —— 选一次文件夹即可播放");
   }
@@ -1540,6 +1548,23 @@ async function restoreLibrary(){
 function trackKey(t){return (t.rel||t.path||"").replace(/\\/g,"/").toLowerCase();}
 /* ---------- 断点续听：记住上次那首 + 几分几秒，重启后回到原处（默认暂停） ---------- */
 const POSKEY="sr.pos";
+/* 权限失效时记下「本来想播哪首」，授权成功后自动接上，不必重新导入 */
+let pendingPlay=null;
+/* 只给指定曲目灌音源并定位到 at 秒；不动 queue / curTrack / UI，也不播放。
+   授权后的补载必须走这里，不能直接调 restorePos（那会把用户刚选的曲目重置回断点那首） */
+async function fillSource(t,at){
+  const f=await fileFor(t);
+  if(!f)return false;
+  const a=cur();release(a);
+  const u=URL.createObjectURL(f);
+  a.src=u;a._u=u;a._tid=t.id;a.load();
+  if(at>2){
+    const apply=()=>{try{a.currentTime=at;}catch(e){}};
+    apply();                                  // 元数据未到时浏览器会暂存为起始位置
+    a.addEventListener("loadedmetadata",apply,{once:true});
+  }
+  return true;
+}
 function savePos(fromEl){
   const a=fromEl||cur();
   if(!curTrack||!a||!a.src)return;          // 没载入音频源时不写，避免把 0 覆盖进记录
@@ -1550,30 +1575,33 @@ function readPos(){
   try{return JSON.parse(localStorage.getItem(POSKEY)||"null");}catch(e){return null;}
 }
 async function restorePos(){
+  /* 启动恢复是异步的（等 IndexedDB）。若用户在这期间已经点了别的歌，
+     绝不能把 curTrack / queue 覆盖回断点那首 —— 否则看起来像"点歌没反应"。 */
+  if(curTrack)return;
   const p=readPos();
   if(!p||!p.k||!DB.tracks.length||!(p.t>2))return;
   const t=DB.tracks.find(x=>trackKey(x)===p.k);
   if(!t)return;
-  const f=await fileFor(t);
-  if(!f)return;                              // 文件夹权限没给就算了，启动时不打扰用户
   const list=sorted(DB.tracks), i=list.indexOf(t);
   if(i<0)return;
-  queue=list;qi=i;curTrack=t;
-  const a=cur();release(a);                  // 只灌源、不播放
-  const u=URL.createObjectURL(f);
-  a.src=u;a._u=u;a._tid=t.id;a.load();
   const d=t.dur||0;
   let at=p.t||0;
   if(d>0&&at>d-8)at=0;                      // 已听到结尾就从头，别一播就切下一首
-  if(at>2){
-    const apply=()=>{try{a.currentTime=at;}catch(e){}};
-    apply();                                  // 立即设：元数据未到时浏览器会暂存为起始位置
-    a.addEventListener("loadedmetadata",apply,{once:true});   // 元数据到了再确认一次
-  }
+  /* 先把「上次那首 + 进度」摆到界面上，不依赖文件权限。
+     浏览器重启后 File 对象和目录权限都会丢，原来在这里直接 return，
+     结果播放条显示「未在播放」，看起来像功能根本没加。 */
+  queue=list;qi=i;curTrack=t;
   updBar();updNP();markCur();
   if(d&&at>2){
     barSeekFill(at/d);
     $("#npCur").textContent=fmt(at);$("#npDur").textContent=fmt(d);
+  }
+  if(!await fillSource(t,at)){
+    /* 界面已摆好但没有音源时，必须明确给出「点一下连接」的出口。
+       否则播放条显示着歌、点播放却只反复弹「请重新选择音乐文件夹」，
+       用户会被误导去重新导入整个曲库。 */
+    if(!IS_FILE)showRelinkBar("连接音乐库以继续播放",
+      "已回到上次位置 "+fmt(at)+" —— 点一下授权即可续播，不用重新导入");
   }
 }
 function dirName(p){const s=p.replace(/\\/g,"/");const i=s.lastIndexOf("/");return i<0?"":s.slice(0,i);}
@@ -1856,6 +1884,14 @@ async function relink(){
       if(r!=="granted"){showRelinkBar("需要文件夹权限","浏览器拒绝了访问请求，可再试一次");return;}
     }
     hideRelinkBar();
+    /* 授权成功后：优先把「刚才点了却播不了」的那首接上并按原意播放；
+       否则只补载当前曲目的音源，不重置用户已选曲目 / 队列 / 断点。 */
+    const pend=pendingPlay;pendingPlay=null;
+    if(pend&&pend.i>=0&&pend.i<queue.length){await load(pend.i,pend.autoplay,pend.at||0);}
+    else if(curTrack&&!cur().src){
+      const p=readPos(),at=p&&p.k===trackKey(curTrack)?(p.t||0):0;
+      await fillSource(curTrack,at);
+    }
     toast("已重新连接，共 "+DB.tracks.length+" 首");
   }catch(e){pickAndLink();}
 }
@@ -2605,11 +2641,23 @@ async function preload(t){
   const u=URL.createObjectURL(f);
   b.src=u;b._u=u;b._tid=t.id;b.load();
 }
-async function load(i,autoplay){
+async function load(i,autoplay,at){
   if(i<0||i>=queue.length)return;
   qi=i;const t=queue[i];
   let tf=await fileFor(t);
-  if(!tf){toast("无法访问文件，请重新选择音乐文件夹");return;}
+  if(!tf){
+    /* 记下断点秒数：授权成功后从原位置接着播，而不是退回 0 */
+    const pp=readPos();
+    pendingPlay={i,autoplay:!!autoplay,at:(pp&&pp.k===trackKey(t))?(pp.t||0):0};
+    if(IS_FILE)toast("本地文件模式无法记住文件夹 —— 请通过网址访问");
+    else{
+      showRelinkBar("连接音乐库以开始播放",
+        "文件夹权限已失效 —— 点一下授权即可播放，不用重新导入");
+      toast("需要重新连接音乐文件夹才能播放");
+    }
+    return;
+  }
+  pendingPlay=null;
   const b=idle();
   if(b._tid===t.id&&b.src){        // 已预热 —— 直接交接
     const old=cur();usingA=!usingA;release(old);
@@ -2619,6 +2667,12 @@ async function load(i,autoplay){
     const u=URL.createObjectURL(tf);
     a.src=u;a._u=u;a._tid=t.id;a.load();
     curTrack=t;
+  }
+  if(at>2){                                  // 授权补载时回到断点位置
+    const a=cur();
+    const apply=()=>{try{a.currentTime=at;}catch(e){}};
+    apply();a.addEventListener("loadedmetadata",apply,{once:true});
+    if(t.dur)barSeekFill(at/t.dur);
   }
   flushListen();resetListenAnchor();LST.plays++;
   updBar();updNP();loadLyric(t);markCur();
@@ -2638,7 +2692,11 @@ async function doPlay(){
   if(!curTrack&&queue.length)await load(qi<0?0:qi,false);
   if(AC&&AC.state==="suspended")await AC.resume().catch(()=>{});
   if(!cur().src){                                  // 只有曲目、没有载入源 —— 不是编码问题
-    if(curTrack)await load(qi>=0?qi:0,true);
+    if(curTrack){
+      await load(qi>=0?qi:0,true);
+      if(!cur().src&&!IS_FILE)showRelinkBar("连接音乐库以开始播放",
+        "点一下授权即可播放，不用重新导入");
+    }else if(!IS_FILE)showRelinkBar("连接音乐库以开始播放","点一下授权即可播放");
     return;
   }
   cur().play().then(()=>{try{navigator.mediaSession.playbackState="playing";}catch(e){}}
@@ -2950,7 +3008,7 @@ function loadLyric(t){
   const fr=new FileReader();
   fr.onload=()=>{
     const s=fr.result;
-    if(/ {2,}/.test(s)){          // 大概率是 GBK，重读一次
+    if(/�{2,}/.test(s)){          // 大概率是 GBK，重读一次
       const f2=new FileReader();
       f2.onload=()=>{t._lrc=parseLRC(f2.result);setLyric(t._lrc);};
       f2.readAsText(t.lrcFile,"gbk");return;
