@@ -1,13 +1,14 @@
 /* 声澜 · Service Worker
-   目的：装成桌面应用后，断网也能秒开。音频文件走本地句柄，不经过这里。 */
-const CACHE = "sr-v1";
+   离线可用，但绝不把旧页面/旧图标一直喂给浏览器。
+   v3：缓存名升级 + 静态资源改网络优先，改完 index.html 刷新即生效。 */
+const CACHE = "sr-v3";
 const ASSETS = [
   "./",
   "./index.html",
   "./manifest.json",
-  "./icon-192.png",
-  "./icon-512.png",
-  "./icon-maskable-512.png"
+  "./icon-192-v2.png",
+  "./icon-512-v2.png",
+  "./icon-maskable-512-v2.png"
 ];
 
 self.addEventListener("install", e => {
@@ -30,33 +31,17 @@ self.addEventListener("fetch", e => {
   const req = e.request;
   if (req.method !== "GET") return;
   const url = new URL(req.url);
-  if (url.origin !== self.location.origin) return;
+  if (url.origin !== self.location.origin) return;   // 音频是 blob:，不经过这里
+  if (url.protocol !== "http:" && url.protocol !== "https:") return;
 
-  // 页面导航：网络优先（拿新版本），断网时回落缓存
-  if (req.mode === "navigate") {
-    e.respondWith(
-      fetch(req)
-        .then(r => {
-          const copy = r.clone();
-          caches.open(CACHE).then(c => c.put("./index.html", copy)).catch(() => {});
-          return r;
-        })
-        .catch(() => caches.match("./index.html").then(r => r || caches.match("./")))
-    );
-    return;
-  }
-
-  // 静态资源：缓存优先
+  // 网络优先：拿得到就用新的并顺手写缓存，拿不到才回落离线缓存
   e.respondWith(
-    caches.match(req).then(hit => {
-      if (hit) return hit;
-      return fetch(req).then(r => {
-        if (r && r.status === 200 && r.type === "basic") {
-          const copy = r.clone();
-          caches.open(CACHE).then(c => c.put(req, copy)).catch(() => {});
-        }
-        return r;
-      }).catch(() => hit);
-    })
+    fetch(req).then(r => {
+      if (r && r.status === 200 && r.type === "basic") {
+        const copy = r.clone();
+        caches.open(CACHE).then(c => c.put(req.mode === "navigate" ? "./index.html" : req, copy)).catch(() => {});
+      }
+      return r;
+    }).catch(() => caches.match(req).then(hit => hit || (req.mode === "navigate" ? caches.match("./index.html") : null)))
   );
 });
